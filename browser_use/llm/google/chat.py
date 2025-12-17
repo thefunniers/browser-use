@@ -4,7 +4,7 @@ import logging
 import random
 import time
 from dataclasses import dataclass, field
-from typing import Any, Literal, TypeVar, overload
+from typing import Any, Literal, TypeVar, overload, cast
 
 from google import genai
 from google.auth.credentials import Credentials
@@ -88,6 +88,8 @@ class ChatGoogle(BaseChatModel):
 	top_p: float | None = None
 	seed: int | None = None
 	thinking_budget: int | None = None  # for gemini-2.5 flash and flash-lite models, default will be set to 0
+	# Gemini-3: prefer thinking_level over legacy thinking_budget
+	thinking_level: Literal['low', 'medium', 'high'] | None = None
 	max_output_tokens: int | None = 8096
 	config: types.GenerateContentConfigDict | None = None
 	include_system_in_user: bool = False
@@ -107,6 +109,9 @@ class ChatGoogle(BaseChatModel):
 
 	# Internal client cache to prevent connection issues
 	_client: genai.Client | None = None
+
+	# Cache of fixed Gemini schemas per output_format to avoid recomputing them
+	_schema_cache: dict[str, dict[str, Any]] = field(default_factory=dict, repr=False)
 
 	# Static
 	@property
@@ -229,11 +234,18 @@ class ChatGoogle(BaseChatModel):
 		if self.seed is not None:
 			config['seed'] = self.seed
 
-		# set default for flash, flash-lite, gemini-flash-lite-latest, and gemini-flash-latest models
-		if self.thinking_budget is None and ('gemini-2.5-flash' in self.model or 'gemini-flash' in self.model):
+		# thinking config: prefer thinking_level (Gemini-3) and disallow both being set
+		if self.thinking_level is not None and self.thinking_budget is not None:
+			raise ValueError('Cannot set both thinking_level and thinking_budget; use thinking_level for Gemini-3')
+
+		# set default for flash families (legacy thinking_budget)
+		if self.thinking_budget is None and ('gemini-2.5-flash' in str(self.model).lower() or 'gemini-flash' in str(self.model).lower()):
 			self.thinking_budget = 0
 
-		if self.thinking_budget is not None:
+		if self.thinking_level is not None:
+			# Prefer the newer thinking_level parameter. Cast to the expected TypedDict to satisfy type checkers.
+			config['thinking_config'] = cast(types.ThinkingConfigDict, {'thinking_level': self.thinking_level})
+		elif self.thinking_budget is not None:
 			thinking_config_dict: types.ThinkingConfigDict = {'thinking_budget': self.thinking_budget}
 			config['thinking_config'] = thinking_config_dict
 
@@ -278,9 +290,15 @@ class ChatGoogle(BaseChatModel):
 						self.logger.debug(f'🔧 Requesting structured output for {output_format.__name__}')
 						config['response_mime_type'] = 'application/json'
 						# Convert Pydantic model to Gemini-compatible schema
-						optimized_schema = SchemaOptimizer.create_gemini_optimized_schema(output_format)
+						cache_key = output_format.__name__
+						gemini_schema = self._schema_cache.get(cache_key)
+						if gemini_schema is None:
+							optimized_schema = SchemaOptimizer.create_gemini_optimized_schema(output_format)
+							gemini_schema = self._fix_gemini_schema(optimized_schema)
+							# Cache the fixed schema for future calls (perf win)
+							self._schema_cache[cache_key] = gemini_schema
 
-						gemini_schema = self._fix_gemini_schema(optimized_schema)
+						# Provide schema under the expected key
 						config['response_schema'] = gemini_schema
 
 						response = await self.get_client().aio.models.generate_content(
@@ -349,8 +367,10 @@ class ChatGoogle(BaseChatModel):
 					else:
 						# Fallback: Request JSON in the prompt for models without native JSON mode
 						self.logger.debug(f'🔄 Using fallback JSON mode for {output_format.__name__}')
-						# Create a copy of messages to modify
-						modified_messages = [m.model_copy(deep=True) for m in messages]
+						# Shallow copy messages and only shallow-copy the last message to reduce CPU/memory
+						modified_messages = list(messages)
+						if modified_messages:
+							modified_messages[-1] = modified_messages[-1].model_copy(deep=False)
 
 						# Add JSON instruction to the last message
 						if modified_messages and isinstance(modified_messages[-1].content, str):
