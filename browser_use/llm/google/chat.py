@@ -244,7 +244,7 @@ class ChatGoogle(BaseChatModel):
 
 		if self.thinking_level is not None:
 			# Prefer the newer thinking_level parameter. Cast to the expected TypedDict to satisfy type checkers.
-			config['thinking_config'] = cast(types.ThinkingConfigDict, {'thinking_level': self.thinking_level})
+			thinking_config_dict = types.ThinkingConfigDict(thinking_level = types.ThinkingLevel(self.thinking_level))
 		elif self.thinking_budget is not None:
 			thinking_config_dict: types.ThinkingConfigDict = {'thinking_budget': self.thinking_budget}
 			config['thinking_config'] = thinking_config_dict
